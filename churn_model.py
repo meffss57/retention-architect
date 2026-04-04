@@ -1,4 +1,3 @@
-
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -28,14 +27,57 @@ print("The Retention Architect")
 print("=" * 60)
 print("\n[1/7] Loading datasets...")
 
-users   = pd.read_csv("train_users.csv",                          low_memory=False)
-props   = pd.read_csv("train_users_properties.csv",               low_memory=False)
-purch   = pd.read_csv("train_users_purchases.csv",                low_memory=False)
-txn     = pd.read_csv("train_users_transaction_attempts_v1.csv",  low_memory=False)
-quizzes = pd.read_csv("train_users_quizzes.csv",                  low_memory=False)
-gens    = pd.read_csv("test_users_generations.csv",               low_memory=False)
+# ---------------------------------------------------------------------------
+# Auto-detect CSV files by their column signatures — not by filename.
+# This works regardless of what the files are named.
+# ---------------------------------------------------------------------------
 
-print(f"  users={users.shape} props={props.shape} purch={purch.shape}")
+# Signature: unique set of columns that identifies each dataset
+SIGNATURES = {
+    "users":   {"churn_status"},
+    "gens":    {"generation_id", "credit_cost", "generation_type"},
+    "props":   {"subscription_start_date", "subscription_plan"},
+    "purch":   {"purchase_type", "purchase_amount_dollars"},
+    "txn":     {"failure_code", "card_brand", "card_funding"},
+    "quizzes": {"frustration", "first_feature", "flow_type"},
+}
+
+import glob, os
+
+def detect_datasets(folder="."):
+    """Scan all CSVs in folder and match each to a dataset role by column signature."""
+    found = {}
+    csv_files = glob.glob(os.path.join(folder, "*.csv"))
+    for path in csv_files:
+        try:
+            cols = set(pd.read_csv(path, nrows=0, low_memory=False).columns)
+        except Exception:
+            continue
+        for role, sig in SIGNATURES.items():
+            if sig.issubset(cols) and role not in found:
+                found[role] = path
+                break
+    return found
+
+detected = detect_datasets(".")
+print("  Detected files:")
+for role, path in detected.items():
+    print(f"    {role:10s} -> {os.path.basename(path)}")
+
+missing = [r for r in SIGNATURES if r not in detected]
+if missing:
+    print(f"\n  WARNING: Could not detect: {missing}")
+    print("  Make sure all dataset CSV files are in the same folder as this script.")
+    raise FileNotFoundError(f"Missing datasets: {missing}")
+
+users   = pd.read_csv(detected["users"],   low_memory=False)
+gens    = pd.read_csv(detected["gens"],    low_memory=False)
+props   = pd.read_csv(detected["props"],   low_memory=False)
+purch   = pd.read_csv(detected["purch"],   low_memory=False)
+txn     = pd.read_csv(detected["txn"],     low_memory=False)
+quizzes = pd.read_csv(detected["quizzes"], low_memory=False)
+
+print(f"\n  users={users.shape} props={props.shape} purch={purch.shape}")
 print(f"  txn={txn.shape} quizzes={quizzes.shape} gens={gens.shape}")
 
 # =============================================================================
@@ -591,4 +633,4 @@ for _, r in submission[submission["churn_type"] == "vol_churn"].head(3).iterrows
     print(f"    reason: {r['reason_1']}")
     print(f"    action: {r['recommended_action'][:90]}")
     print()
-print("Done")
+print("Done.")
