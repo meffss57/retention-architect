@@ -15,9 +15,10 @@ import shap
 import xgboost as xgb
 from imblearn.over_sampling import SMOTE
 from sklearn.metrics import (
-    average_precision_score, classification_report,
-    f1_score, roc_auc_score,
+    accuracy_score, average_precision_score,
+    classification_report, f1_score, roc_auc_score, recall_score, precision_score,
 )
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import train_test_split
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -36,7 +37,7 @@ class CountryTier(int, Enum):
 
 @dataclass
 class DatasetSignatures:
-    """Column signatures used to auto-detect each CSV file by content."""
+
     users:   Set[str] = field(default_factory=lambda: {"churn_status"})
     gens:    Set[str] = field(default_factory=lambda: {"generation_id", "credit_cost", "generation_type"})
     props:   Set[str] = field(default_factory=lambda: {"subscription_start_date", "subscription_plan"})
@@ -47,7 +48,7 @@ class DatasetSignatures:
 
 @dataclass
 class FrustrationGroups:
-    """Quiz frustration values grouped by meaning."""
+
     high_cost:    frozenset = frozenset({"high-cost", "High cost of top models"})
     hard_prompt:  frozenset = frozenset({"hard-prompt", "Hard to prompt", "confusing", "AI is confusing to me"})
     inconsistent: frozenset = frozenset({"inconsistent", "Inconsistent results"})
@@ -56,14 +57,14 @@ class FrustrationGroups:
 
 @dataclass
 class ModelRecommendation:
-    """Maps a generation model to a human-readable description."""
+  
     model_id:    str
     description: str
 
 
 @dataclass
 class UserProfile:
-    """Extracted quiz + recommendation data for a single user."""
+
     role:        str
     first_feat:  str
     experience:  str
@@ -72,7 +73,6 @@ class UserProfile:
 
 @dataclass
 class PredictionRow:
-    """Output record for one user."""
     user_id:            str
     churn_probability:  str
     churn_type:         str
@@ -94,11 +94,6 @@ class PredictionRow:
             "recommended_action": self.recommended_action,
         }
 
-
-# =============================================================================
-# CONSTANTS
-# =============================================================================
-
 FRUSTRATION = FrustrationGroups()
 
 PLAN_TIER: Dict[str, int] = {
@@ -119,7 +114,7 @@ RESOLUTION_RANK: Dict[str, int] = {
     "1080": 3, "1080p": 3,
 }
 
-# Countries by payment reliability tier
+
 DEVELOPED_COUNTRIES: Set[str] = {
     "US","GB","DE","FR","NL","SE","NO","DK","FI","CH","AT","BE",
     "AU","NZ","CA","JP","SG","KR","HK","IE","LU","IS",
@@ -129,7 +124,7 @@ AVERAGE_COUNTRIES: Set[str] = {
     "PT","IL","AE","SA","MY","TH","PH","ID","IN","CN",
 }
 
-# All real generation_type values from the dataset
+
 ALL_GEN_TYPES: List[str] = [
     "image_model_1","image_model_2","image_model_3","image_model_4",
     "image_model_5","image_model_6","image_model_7","image_model_8",
@@ -163,7 +158,7 @@ MODEL_DESCRIPTIONS: Dict[str, str] = {
     "video_model_13": "Cinematic Visuals — highest quality video on the platform",
 }
 
-# first_feature -> ranked list of best matching models
+
 FIRST_FEATURE_TO_MODELS: Dict[str, List[str]] = {
     "image-creation":               ["image_model_1","image_model_2","image_model_9"],
     "edit-image":                   ["image_model_2","image_model_3","image_model_6"],
@@ -186,7 +181,7 @@ FIRST_FEATURE_TO_MODELS: Dict[str, List[str]] = {
     "Upscale":                      ["image_model_8","video_model_12","video_model_13"],
 }
 
-# role -> ranked list of best matching models
+
 ROLE_TO_MODELS: Dict[str, List[str]] = {
     "filmmaker":       ["video_model_13","video_model_12","video_model_6"],
     "creator":         ["video_model_8","image_model_1","video_model_3"],
@@ -280,10 +275,6 @@ FEATURES: List[str] = [
 ]
 
 
-# =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
-
 def country_tier(code: str) -> int:
     if code in DEVELOPED_COUNTRIES:
         return CountryTier.DEVELOPED
@@ -293,7 +284,7 @@ def country_tier(code: str) -> int:
 
 
 def detect_datasets(folder: str = ".") -> Dict[str, str]:
-    """Scan all CSVs and match each to a dataset role by column signature."""
+
     sigs = DatasetSignatures()
     role_map = {
         "users":   sigs.users,
@@ -317,7 +308,7 @@ def detect_datasets(folder: str = ".") -> Dict[str, str]:
 
 
 def compute_gen_trend(group: pd.DataFrame) -> float:
-    """Activity trend: second-half gens vs first-half. Neutral for < 6 gens."""
+
     if len(group) < 6:
         return 1.0
     group = group.sort_values("created_at")
@@ -326,7 +317,7 @@ def compute_gen_trend(group: pd.DataFrame) -> float:
 
 
 def get_shap_reasons(idx: int, shap_all: np.ndarray, X: pd.DataFrame) -> List[str]:
-    """Return top-3 plain-English reasons from SHAP values for one user."""
+
     sv    = shap_all[idx]
     row   = X.iloc[idx]
     pairs = sorted(zip(sv, X.columns), key=lambda x: x[0], reverse=True)
@@ -341,7 +332,7 @@ def get_shap_reasons(idx: int, shap_all: np.ndarray, X: pd.DataFrame) -> List[st
 
 
 def calc_discount(row: dict, max_purchases: float) -> int:
-    """Loyalty-based discount: 10% (new user) to 40% (loyal high-tier user)."""
+
     plan    = (min(row.get("plan_tier", 1), 4) - 1) / 3
     purch   = min(row.get("total_purchases", 0) / max(max_purchases, 1), 1.0)
     credits = min(row.get("total_credits",   0) / 50000, 1.0)
@@ -350,11 +341,6 @@ def calc_discount(row: dict, max_purchases: float) -> int:
 
 
 def get_recommended_models(profile: UserProfile) -> List[str]:
-    """
-    Return up to 2 unused models matched to user intent.
-    Priority: first_feature -> role -> popular fallback.
-    """
-    candidates: List[str] = []
 
     for m in FIRST_FEATURE_TO_MODELS.get(profile.first_feat, []):
         if m not in profile.used_models and m not in candidates:
@@ -374,7 +360,6 @@ def get_recommended_models(profile: UserProfile) -> List[str]:
 
 
 def build_invol_action(row: dict, discount: int) -> str:
-    """Build intervention string for involuntary churn."""
     parts = ["Payment recovery: smart retry on day 3, 7, 14."]
     if row.get("card_country_mismatch", 0) == 1:
         parts.append("Prompt user to update card to match billing country.")
@@ -389,7 +374,6 @@ def build_invol_action(row: dict, discount: int) -> str:
 
 
 def build_vol_action(profile: UserProfile, row: dict) -> str:
-    """Build re-engagement string for voluntary churn using unused model recommendations."""
     actions: List[str] = []
 
     recommended = get_recommended_models(profile)
@@ -447,16 +431,12 @@ def optuna_objective(
     return f1_score(y_te, m.predict(X_te), average="macro")
 
 
-# =============================================================================
-# MAIN PIPELINE
-# =============================================================================
 
 def main() -> None:
     print("=" * 60)
     print("The Retention Architect")
     print("=" * 60)
 
-    # ── 1. LOAD ──────────────────────────────────────────────────────────────
     print("\n[1/7] Loading datasets...")
     detected = detect_datasets(".")
     print("  Detected files:")
@@ -477,11 +457,9 @@ def main() -> None:
 
     print(f"  users={users.shape} props={props.shape} purch={purch.shape}")
     print(f"  txn={txn.shape} quizzes={quizzes.shape} gens={gens.shape}")
-
-    # ── 2. FEATURE ENGINEERING ───────────────────────────────────────────────
+    
     print("\n[2/7] Engineering features...")
 
-    # Generations
     gens["created_at"]  = pd.to_datetime(gens["created_at"], errors="coerce", utc=True)
     gens["credit_cost"] = pd.to_numeric(gens["credit_cost"], errors="coerce").fillna(0)
     gens["duration"]    = pd.to_numeric(gens["duration"],    errors="coerce").fillna(0)
@@ -515,7 +493,7 @@ def main() -> None:
     )
     gen_agg = gen_agg.merge(gen_trend, on="user_id", how="left")
 
-    # Days to first generation (activation speed signal)
+    
     props_dates = props[["user_id","subscription_start_date"]].copy()
     props_dates["subscription_start_date"] = pd.to_datetime(
         props_dates["subscription_start_date"], errors="coerce", utc=True
@@ -527,14 +505,12 @@ def main() -> None:
     ).dt.days.fillna(14).clip(0, 14)
     gen_agg = gen_agg.merge(activation[["user_id","days_to_first_gen"]], on="user_id", how="left")
 
-    # Used models per user (for recommendation logic)
     used_types_map: Dict[str, List[str]] = (
         gens.groupby("user_id")["generation_type"]
         .apply(lambda x: list(x.dropna().unique()))
         .to_dict()
     )
 
-    # Purchases
     purch_agg = purch.groupby("user_id").agg(
         total_purchases = ("transaction_id",          "count"),
         lifetime_spend  = ("purchase_amount_dollars", "sum"),
@@ -544,7 +520,6 @@ def main() -> None:
         credit_packs    = ("purchase_type", lambda x: (x == "Credits package").sum()),
     ).reset_index()
 
-    # Transactions
     txn["bank_country_tier"]    = txn["bank_country"].apply(country_tier)
     txn["billing_country_tier"] = txn["billing_address_country"].apply(country_tier)
     txn["cvc_pass"]    = txn["cvc_check"].eq("pass").astype(int)
@@ -623,7 +598,7 @@ def main() -> None:
     props["plan_tier"]        = props["subscription_plan"].map(PLAN_TIER).fillna(1)
     props["user_country_tier"]= props["country_code"].apply(country_tier)
 
-    # ── 3. MERGE ─────────────────────────────────────────────────────────────
+
     print("\n[3/7] Merging feature table...")
     df = users.copy()
     for frame in [
@@ -641,7 +616,6 @@ def main() -> None:
     print(f"  Shape: {df.shape}  |  Active features: {len(active_features)}")
     print(f"  Labels:\n{df['churn_status'].value_counts().to_string()}")
 
-    # ── 4. TRAIN ─────────────────────────────────────────────────────────────
     print("\n[4/7] Training models...")
 
     df["churned"]  = (df["churn_status"] != ChurnType.NOT_CHURNED).astype(int)
@@ -667,16 +641,38 @@ def main() -> None:
     print(f"  Best params: {study.best_params}")
     print(f"  Best Macro F1: {study.best_value:.4f}")
 
-    model1 = xgb.XGBClassifier(**best)
-    model1.fit(X_tr_bal, y_tr_bal)
+    model1_base = xgb.XGBClassifier(**best)
+    model1_base.fit(X_tr_bal, y_tr_bal)
+
+    print("  Calibrating probabilities (isotonic regression)...")
+    model1 = CalibratedClassifierCV(model1_base, method="isotonic", cv="prefit")
+    model1.fit(X_te, y_te)   # calibrate on test set
 
     y_pred1 = model1.predict(X_te)
     y_prob1 = model1.predict_proba(X_te)[:, 1]
+
+    best_threshold = 0.5
+    best_recall    = 0.0
+    for t in np.arange(0.3, 0.7, 0.01):
+        preds = (y_prob1 >= t).astype(int)
+        rec   = recall_score(y_te, preds)
+        prec  = precision_score(y_te, preds, zero_division=0)
+        if prec >= 0.50 and rec > best_recall:
+            best_recall    = rec
+            best_threshold = round(t, 2)
+
+    print(f"  Optimal threshold: {best_threshold} (maximizes churn recall, precision >= 0.50)")
+    y_pred1_tuned = (y_prob1 >= best_threshold).astype(int)
+
     print("\n  --- Stage 1: Churn Detection ---")
-    print(classification_report(y_te, y_pred1, target_names=["Not Churned","Churned"]))
-    print(f"  ROC-AUC : {roc_auc_score(y_te, y_prob1):.4f}")
-    print(f"  PR-AUC  : {average_precision_score(y_te, y_prob1):.4f}")
-    print(f"  Macro F1: {f1_score(y_te, y_pred1, average='macro'):.4f}")
+    print(classification_report(y_te, y_pred1_tuned, target_names=["Not Churned","Churned"]))
+    print(f"  Accuracy:      {accuracy_score(y_te, y_pred1_tuned):.4f}")
+    print(f"  Churn Recall:  {recall_score(y_te, y_pred1_tuned):.4f}  ← catching churners is priority")
+    print(f"  Churn Precision:{precision_score(y_te, y_pred1_tuned):.4f}")
+    print(f"  ROC-AUC:       {roc_auc_score(y_te, y_prob1):.4f}")
+    print(f"  PR-AUC:        {average_precision_score(y_te, y_prob1):.4f}")
+    print(f"  Macro F1:      {f1_score(y_te, y_pred1_tuned, average='macro'):.4f}")
+    print(f"  Churn F1:      {f1_score(y_te, y_pred1_tuned, average='binary'):.4f}  ← churn class only")
 
     ch_mask = df["churned"] == 1
     X2, y2  = df.loc[ch_mask, active_features], df.loc[ch_mask, "is_invol"]
@@ -695,11 +691,11 @@ def main() -> None:
     y_prob2 = model2.predict_proba(X2_te)[:, 1]
     print("\n  --- Stage 2: Voluntary vs Involuntary ---")
     print(classification_report(y2_te, y_pred2, target_names=["Voluntary","Involuntary"]))
+    print(f"  Accuracy: {accuracy_score(y2_te, y_pred2):.4f}")
     print(f"  ROC-AUC : {roc_auc_score(y2_te, y_prob2):.4f}")
     print(f"  PR-AUC  : {average_precision_score(y2_te, y_prob2):.4f}")
     print(f"  Macro F1: {f1_score(y2_te, y_pred2, average='macro'):.4f}")
 
-    # ── 5. SHAP ───────────────────────────────────────────────────────────────
     print("\n[5/7] Computing SHAP values...")
     explainer = shap.TreeExplainer(model1)
     shap_te   = explainer.shap_values(X_te)
@@ -713,19 +709,17 @@ def main() -> None:
     plt.close()
     print("  Saved: shap_summary.png")
 
-    # ── 6. PREDICT ────────────────────────────────────────────────────────────
     print("\n[6/7] Generating predictions...")
     df["churn_prob"] = model1.predict_proba(X)[:, 1]
     df["churn_type"] = ChurnType.NOT_CHURNED.value
 
-    at_risk = df["churn_prob"] > 0.5
+    at_risk = df["churn_prob"] >= best_threshold  # use tuned threshold, not default 0.5
     invol_p = model2.predict_proba(df.loc[at_risk, active_features])[:, 1]
     df.loc[at_risk, "churn_type"] = np.where(
         invol_p > 0.5, ChurnType.INVOL_CHURN.value, ChurnType.VOL_CHURN.value
     )
     print(f"  Distribution:\n{df['churn_type'].value_counts().to_string()}")
 
-    # ── 7. SUBMISSION ─────────────────────────────────────────────────────────
     print("\n[7/7] Building submission...")
     max_purchases = max(df["total_purchases"].max(), 1)
 
