@@ -24,8 +24,13 @@ Files needed:
 
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.metrics import (
+    classification_report, roc_auc_score, average_precision_score,
+    roc_curve, precision_recall_curve, confusion_matrix,
+    log_loss, brier_score_loss,
+)
+from sklearn.calibration import calibration_curve
 import xgboost as xgb
 import warnings
 warnings.filterwarnings('ignore')
@@ -253,6 +258,169 @@ if y2.nunique() > 1:
     print("\n  --- Stage 2: Voluntary vs Involuntary ---")
     print(classification_report(y2_te, model2.predict(X2_te),
           target_names=['Voluntary', 'Involuntary']))
+
+# ── METRICS ───────────────────────────────────────────────────────────────
+print("\n[METRICS] Считаем полные метрики модели...")
+
+def compute_and_plot_metrics(model, X_train, X_test, y_train, y_test,
+                              stage_name, class_names, filename_prefix,
+                              cv_X=None, cv_y=None):
+    """
+    Вычисляет и сохраняет полный набор метрик для одного этапа модели.
+    Возвращает dict с основными числовыми метриками.
+    """
+    y_pred      = model.predict(X_test)
+    y_prob      = model.predict_proba(X_test)[:, 1]
+
+    roc_auc     = roc_auc_score(y_test, y_prob)
+    pr_auc      = average_precision_score(y_test, y_prob)
+    ll          = log_loss(y_test, y_prob)
+    brier       = brier_score_loss(y_test, y_prob)
+
+    # 5-fold CV ROC-AUC на обучающей выборке
+    cv_roc = None
+    if cv_X is not None and cv_y is not None:
+        cv_scores = cross_val_score(
+            model, cv_X, cv_y, cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
+            scoring='roc_auc', n_jobs=-1,
+        )
+        cv_roc = cv_scores
+
+    print(f"\n  ══ {stage_name} ══")
+    print(f"  ROC-AUC          : {roc_auc:.4f}")
+    print(f"  PR-AUC           : {pr_auc:.4f}  (precision-recall, важно при дисбалансе классов)")
+    print(f"  Log Loss         : {ll:.4f}")
+    print(f"  Brier Score      : {brier:.4f}  (0 — идеально, 0.25 — случайно)")
+    if cv_roc is not None:
+        print(f"  CV ROC-AUC (5-fold): {cv_roc.mean():.4f} ± {cv_roc.std():.4f}")
+
+    # ── Confusion matrix ──────────────────────────────────────────────────
+    cm = confusion_matrix(y_test, y_pred)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+    fig.suptitle(f"Метрики модели — {stage_name}", fontsize=14, fontweight='bold')
+
+    # 1. Confusion matrix
+    ax = axes[0, 0]
+    im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
+    ax.set_title('Confusion Matrix')
+    tick_marks = np.arange(len(class_names))
+    ax.set_xticks(tick_marks)
+    ax.set_yticks(tick_marks)
+    ax.set_xticklabels(class_names)
+    ax.set_yticklabels(class_names)
+    ax.set_ylabel('Истинный класс')
+    ax.set_xlabel('Предсказанный класс')
+    thresh = cm.max() / 2.0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, f'{cm[i, j]}', ha='center', va='center',
+                    color='white' if cm[i, j] > thresh else 'black', fontsize=12)
+    fig.colorbar(im, ax=ax)
+
+    # 2. ROC curve
+    ax = axes[0, 1]
+    fpr, tpr, _ = roc_curve(y_test, y_prob)
+    ax.plot(fpr, tpr, color='steelblue', lw=2, label=f'ROC-AUC = {roc_auc:.4f}')
+    ax.plot([0, 1], [0, 1], 'k--', lw=1, label='Случайная модель')
+    ax.set_xlabel('False Positive Rate')
+    ax.set_ylabel('True Positive Rate (Recall)')
+    ax.set_title('ROC Curve')
+    ax.legend(loc='lower right')
+    ax.grid(alpha=0.3)
+
+    # 3. Precision-Recall curve
+    ax = axes[1, 0]
+    prec, rec, _ = precision_recall_curve(y_test, y_prob)
+    baseline = y_test.mean()
+    ax.plot(rec, prec, color='darkorange', lw=2, label=f'PR-AUC = {pr_auc:.4f}')
+    ax.axhline(baseline, color='k', linestyle='--', lw=1,
+               label=f'Baseline (доля класса 1) = {baseline:.3f}')
+    ax.set_xlabel('Recall')
+    ax.set_ylabel('Precision')
+    ax.set_title('Precision-Recall Curve')
+    ax.legend(loc='upper right')
+    ax.grid(alpha=0.3)
+
+    # 4. Calibration curve
+    ax = axes[1, 1]
+    fraction_pos, mean_pred = calibration_curve(y_test, y_prob, n_bins=10)
+    ax.plot(mean_pred, fraction_pos, 's-', color='green', lw=2, label='Модель')
+    ax.plot([0, 1], [0, 1], 'k--', lw=1, label='Идеальная калибровка')
+    ax.set_xlabel('Средняя предсказанная вероятность')
+    ax.set_ylabel('Доля позитивных')
+    ax.set_title(f'Calibration Curve\nBrier={brier:.4f}  |  LogLoss={ll:.4f}')
+    ax.legend(loc='upper left')
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    out_path = f"{filename_prefix}_metrics.png"
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  График сохранён: {out_path}")
+
+    # ── CV распределение (если есть) ──────────────────────────────────────
+    if cv_roc is not None:
+        fig2, ax2 = plt.subplots(figsize=(6, 4))
+        ax2.bar(range(1, 6), cv_roc, color='steelblue', alpha=0.8, edgecolor='white')
+        ax2.axhline(cv_roc.mean(), color='red', linestyle='--',
+                    label=f'Среднее = {cv_roc.mean():.4f}')
+        ax2.set_xlabel('Fold')
+        ax2.set_ylabel('ROC-AUC')
+        ax2.set_title(f'5-Fold Cross-Validation ROC-AUC\n{stage_name}')
+        ax2.set_ylim(max(0, cv_roc.min() - 0.05), min(1, cv_roc.max() + 0.05))
+        ax2.legend()
+        ax2.grid(alpha=0.3, axis='y')
+        cv_path = f"{filename_prefix}_cv.png"
+        plt.savefig(cv_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  CV-график сохранён: {cv_path}")
+
+    return {
+        'roc_auc': roc_auc,
+        'pr_auc':  pr_auc,
+        'log_loss': ll,
+        'brier':    brier,
+        'cv_mean':  cv_roc.mean() if cv_roc is not None else None,
+        'cv_std':   cv_roc.std()  if cv_roc is not None else None,
+    }
+
+
+metrics1 = compute_and_plot_metrics(
+    model1, X_tr, X_te, y_tr, y_te,
+    stage_name    = "Stage 1: Churn vs Not Churned",
+    class_names   = ['Not Churned', 'Churned'],
+    filename_prefix = "stage1",
+    cv_X = X_tr, cv_y = y_tr,
+)
+
+metrics2 = None
+if model2 is not None:
+    metrics2 = compute_and_plot_metrics(
+        model2, X2_tr, X2_te, y2_tr, y2_te,
+        stage_name    = "Stage 2: Voluntary vs Involuntary",
+        class_names   = ['Voluntary', 'Involuntary'],
+        filename_prefix = "stage2",
+        cv_X = X2_tr, cv_y = y2_tr,
+    )
+
+# ── Сводная таблица метрик ─────────────────────────────────────────────────
+print("\n" + "=" * 60)
+print("СВОДКА МЕТРИК")
+print("=" * 60)
+summary_rows = [
+    ("Stage 1 (Churn/Not)",  metrics1),
+]
+if metrics2:
+    summary_rows.append(("Stage 2 (Vol/Invol)", metrics2))
+
+header = f"{'Этап':<26} {'ROC-AUC':>8} {'PR-AUC':>8} {'LogLoss':>8} {'Brier':>7} {'CV AUC':>10}"
+print(header)
+print("-" * len(header))
+for name, m in summary_rows:
+    cv_str = f"{m['cv_mean']:.4f}±{m['cv_std']:.4f}" if m['cv_mean'] else "  —"
+    print(f"{name:<26} {m['roc_auc']:>8.4f} {m['pr_auc']:>8.4f} "
+          f"{m['log_loss']:>8.4f} {m['brier']:>7.4f} {cv_str:>10}")
+print("=" * 60)
 
 # ── 9. PREDICT ────────────────────────────────────────────────────────────
 
