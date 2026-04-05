@@ -1,22 +1,5 @@
-"""
-The Retention Architect
-=======================
-Two-stage churn prediction pipeline with explainability and intervention strategy.
-
-Timeline:
-  Day 0     — user registers, fills quiz
-  Day 0-14  — observation window (generations, purchases, transactions)
-  Day 14-30 — hidden window
-  Day 30    — label measured (churn_status)
-
-Outputs:
-    predictions.csv   - churn probability, type, reasons, discount, action
-    shap_summary.png  - global feature importance chart
-"""
-
 import warnings
 warnings.filterwarnings("ignore")
-
 import glob
 import os
 from dataclasses import dataclass, field
@@ -110,6 +93,7 @@ class PredictionRow:
         }
 
 FRUSTRATION = FrustrationGroups()
+
 
 PLAN_TIER: Dict[str, int] = {
     "Higgsfield Basic":   1,
@@ -313,7 +297,7 @@ def detect_datasets(folder: str = ".") -> Tuple[Dict[str, str], Dict[str, str]]:
     all_csvs = sorted(glob.glob(os.path.join(folder, "*.csv")))
     for path in all_csvs:
         basename = os.path.basename(path).lower()
-        if basename in ("predictions.csv",):
+        if any(x in basename for x in ("predictions", "submission", "гение", "общество")):
             continue
         try:
             cols = set(pd.read_csv(path, nrows=0, low_memory=False).columns)
@@ -486,12 +470,14 @@ def optuna_objective(
     scale_pos_weight: float = 1.0,
 ) -> float:
     params = dict(
-        n_estimators      = trial.suggest_int("n_estimators", 200, 800),
-        max_depth         = trial.suggest_int("max_depth", 3, 8),
-        learning_rate     = trial.suggest_float("learning_rate", 0.01, 0.2),
-        subsample         = trial.suggest_float("subsample", 0.6, 1.0),
-        colsample_bytree  = trial.suggest_float("colsample_bytree", 0.6, 1.0),
-        min_child_weight  = trial.suggest_int("min_child_weight", 1, 10),
+        n_estimators      = trial.suggest_int("n_estimators", 100, 500),
+        max_depth         = trial.suggest_int("max_depth", 2, 5),
+        learning_rate     = trial.suggest_float("learning_rate", 0.01, 0.1),
+        subsample         = trial.suggest_float("subsample", 0.5, 0.8),
+        colsample_bytree  = trial.suggest_float("colsample_bytree", 0.5, 0.8),
+        min_child_weight  = trial.suggest_int("min_child_weight", 5, 30),
+        reg_alpha         = trial.suggest_float("reg_alpha", 0.1, 5.0),
+        reg_lambda        = trial.suggest_float("reg_lambda", 1.0, 10.0),
         scale_pos_weight  = scale_pos_weight,
         eval_metric       = "aucpr",
         random_state      = 42,
@@ -775,37 +761,31 @@ def main() -> None:
 
     model1_base = xgb.XGBClassifier(**best)
     model1_base.fit(X_tr_bal, y_tr_bal)
+    model1 = model1_base
 
-    print("  Calibrating probabilities (isotonic regression)...")
-    model1 = CalibratedClassifierCV(model1_base, method="isotonic", cv="prefit")
-    model1.fit(X_te, y_te)
-
-    y_pred1 = model1.predict(X_te)
     y_prob1 = model1.predict_proba(X_te)[:, 1]
 
-    best_threshold = 0.5
-    best_recall    = 0.0
-    for t in np.arange(0.3, 0.7, 0.01):
-        preds = (y_prob1 >= t).astype(int)
-        rec   = recall_score(y_te, preds)
-        prec  = precision_score(y_te, preds, zero_division=0)
-        if prec >= 0.50 and rec > best_recall:
-            best_recall    = rec
-            best_threshold = round(t, 2)
+    train_churn_rate = float(y1.mean())
+    sorted_probs = np.sort(y_prob1)
+    threshold_idx = int(len(sorted_probs) * (1 - train_churn_rate))
+    best_threshold = float(sorted_probs[threshold_idx])
+    best_threshold = round(best_threshold, 4)
 
-    print(f"  Optimal threshold: {best_threshold} (maximizes churn recall, precision >= 0.50)")
+    print(f"  Train churn rate: {train_churn_rate:.2%}")
+    print(f"  Prior-adjusted threshold: {best_threshold}")
+
     y_pred1_tuned = (y_prob1 >= best_threshold).astype(int)
 
     print("\n  --- Stage 1: Churn Detection ---")
     print(classification_report(y_te, y_pred1_tuned, target_names=["Not Churned","Churned"]))
     print(f"  Accuracy:      {accuracy_score(y_te, y_pred1_tuned):.4f}")
-    print(f"  Churn Recall:  {recall_score(y_te, y_pred1_tuned):.4f}  ← catching churners is priority")
+    print(f"  Churn Recall:  {recall_score(y_te, y_pred1_tuned):.4f}")
     print(f"  Churn Precision:{precision_score(y_te, y_pred1_tuned):.4f}")
     print(f"  ROC-AUC:       {roc_auc_score(y_te, y_prob1):.4f}")
     print(f"  PR-AUC:        {average_precision_score(y_te, y_prob1):.4f}")
-    print(f"  Weighted F1:   {f1_score(y_te, y_pred1_tuned, average='weighted'):.4f}  ← leaderboard metric")
+    print(f"  Weighted F1:   {f1_score(y_te, y_pred1_tuned, average='weighted'):.4f}")
     print(f"  Macro F1:      {f1_score(y_te, y_pred1_tuned, average='macro'):.4f}")
-    print(f"  Churn F1:      {f1_score(y_te, y_pred1_tuned, average='binary'):.4f}  ← churn class only")
+    print(f"  Churn F1:      {f1_score(y_te, y_pred1_tuned, average='binary'):.4f}")
 
     ch_mask = df_train["churned"] == 1
     X2 = df_train.loc[ch_mask, active_features]
@@ -850,7 +830,16 @@ def main() -> None:
     df_test["churn_prob"] = model1.predict_proba(X_test)[:, 1]
     df_test["churn_type"] = ChurnType.NOT_CHURNED.value
 
-    at_risk = df_test["churn_prob"] >= best_threshold
+    train_churn_rate = df_train["churned"].mean()
+    probs_sorted = np.sort(df_test["churn_prob"].values)[::-1]
+    n_churn_expected = int(len(df_test) * train_churn_rate)
+    prior_threshold = float(probs_sorted[min(n_churn_expected, len(probs_sorted)-1)])
+    threshold = max(prior_threshold, best_threshold)
+    print(f"  Train churn rate: {train_churn_rate:.2%}")
+    print(f"  Prior-based threshold: {prior_threshold:.3f}")
+    print(f"  Tuned threshold:       {best_threshold:.3f}")
+    print(f"  Final threshold used:  {threshold:.3f}")
+    at_risk = df_test["churn_prob"] >= threshold
     invol_p = model2.predict_proba(df_test.loc[at_risk, active_features])[:, 1]
     df_test.loc[at_risk, "churn_type"] = np.where(
         invol_p > 0.5, ChurnType.INVOL_CHURN.value, ChurnType.VOL_CHURN.value
