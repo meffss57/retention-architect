@@ -1,5 +1,22 @@
+"""
+The Retention Architect
+=======================
+Two-stage churn prediction pipeline with explainability and intervention strategy.
+
+Timeline:
+  Day 0     — user registers, fills quiz
+  Day 0-14  — observation window (generations, purchases, transactions)
+  Day 14-30 — hidden window
+  Day 30    — label measured (churn_status)
+
+Outputs:
+    predictions.csv   - churn probability, type, reasons, discount, action
+    shap_summary.png  - global feature importance chart
+"""
+
 import warnings
 warnings.filterwarnings("ignore")
+
 import glob
 import os
 from dataclasses import dataclass, field
@@ -36,12 +53,13 @@ class CountryTier(int, Enum):
 @dataclass
 class DatasetSignatures:
     """Column signatures used to auto-detect each CSV file by content."""
-    users:   Set[str] = field(default_factory=lambda: {"churn_status"})
-    gens:    Set[str] = field(default_factory=lambda: {"generation_id", "credit_cost", "generation_type"})
-    props:   Set[str] = field(default_factory=lambda: {"subscription_start_date", "subscription_plan"})
-    purch:   Set[str] = field(default_factory=lambda: {"purchase_type", "purchase_amount_dollars"})
-    txn:     Set[str] = field(default_factory=lambda: {"failure_code", "card_brand", "card_funding"})
-    quizzes: Set[str] = field(default_factory=lambda: {"frustration", "first_feature", "flow_type"})
+    users:        Set[str] = field(default_factory=lambda: {"churn_status"})
+    test_users:   Set[str] = field(default_factory=lambda: {"user_id"})
+    gens:         Set[str] = field(default_factory=lambda: {"generation_id", "credit_cost", "generation_type"})
+    props:        Set[str] = field(default_factory=lambda: {"subscription_start_date", "subscription_plan"})
+    purch:        Set[str] = field(default_factory=lambda: {"purchase_type", "purchase_amount_dollars"})
+    txn:          Set[str] = field(default_factory=lambda: {"failure_code", "card_brand", "card_funding"})
+    quizzes:      Set[str] = field(default_factory=lambda: {"frustration", "first_feature", "flow_type"})
 
 @dataclass
 class FrustrationGroups:
@@ -274,8 +292,11 @@ def country_tier(code: str) -> int:
         return CountryTier.AVERAGE
     return CountryTier.LOW
 
-def detect_datasets(folder: str = ".") -> Dict[str, str]:
-    """Scan all CSVs and match each to a dataset role by column signature."""
+def detect_datasets(folder: str = ".") -> Tuple[Dict[str, str], Dict[str, str]]:
+    """
+    Scan all CSVs and split into train and test datasets by filename prefix.
+    Returns (train_files, test_files) each mapping role -> path.
+    """
     sigs = DatasetSignatures()
     role_map = {
         "users":   sigs.users,
@@ -285,17 +306,30 @@ def detect_datasets(folder: str = ".") -> Dict[str, str]:
         "txn":     sigs.txn,
         "quizzes": sigs.quizzes,
     }
-    found: Dict[str, str] = {}
-    for path in glob.glob(os.path.join(folder, "*.csv")):
+
+    train_files: Dict[str, str] = {}
+    test_files:  Dict[str, str] = {}
+
+    all_csvs = sorted(glob.glob(os.path.join(folder, "*.csv")))
+    for path in all_csvs:
+        basename = os.path.basename(path).lower()
+        if basename in ("predictions.csv",):
+            continue
         try:
             cols = set(pd.read_csv(path, nrows=0, low_memory=False).columns)
         except Exception:
             continue
+        is_train = "train_" in basename
+        is_test  = "test_"  in basename
         for role, sig in role_map.items():
-            if sig.issubset(cols) and role not in found:
-                found[role] = path
+            if sig.issubset(cols):
+                if is_train and role not in train_files:
+                    train_files[role] = path
+                elif is_test and role not in test_files:
+                    test_files[role] = path
                 break
-    return found
+
+    return train_files, test_files
 
 def compute_gen_trend(group: pd.DataFrame) -> float:
     """Activity trend: second-half gens vs first-half. Neutral for < 6 gens."""
@@ -473,187 +507,251 @@ def main() -> None:
     print("=" * 60)
 
     print("\n[1/7] Loading datasets...")
-    detected = detect_datasets(".")
-    print("  Detected files:")
-    for role, path in detected.items():
+    train_files, test_files = detect_datasets(".")
+
+    print("  Train files:")
+    for role, path in train_files.items():
+        print(f"    {role:10s} -> {os.path.basename(path)}")
+    print("  Test files:")
+    for role, path in test_files.items():
         print(f"    {role:10s} -> {os.path.basename(path)}")
 
-    missing = [r for r in ["users","gens","props","purch","txn","quizzes"]
-               if r not in detected]
-    if missing:
-        raise FileNotFoundError(f"Missing datasets: {missing}")
+    required_train = ["users", "gens", "props", "purch", "txn", "quizzes"]
+    required_test  = ["gens", "props", "purch", "txn", "quizzes"]
+    missing_train = [r for r in required_train if r not in train_files]
+    missing_test  = [r for r in required_test  if r not in test_files]
+    if missing_train:
+        raise FileNotFoundError(f"Missing train datasets: {missing_train}")
+    if missing_test:
+        raise FileNotFoundError(f"Missing test datasets: {missing_test}")
 
-    users   = pd.read_csv(detected["users"],   low_memory=False)
-    gens    = pd.read_csv(detected["gens"],    low_memory=False)
-    props   = pd.read_csv(detected["props"],   low_memory=False)
-    purch   = pd.read_csv(detected["purch"],   low_memory=False)
-    txn     = pd.read_csv(detected["txn"],     low_memory=False)
-    quizzes = pd.read_csv(detected["quizzes"], low_memory=False)
+    users        = pd.read_csv(train_files["users"],   low_memory=False)
+    gens_train   = pd.read_csv(train_files["gens"],    low_memory=False, usecols=lambda c: c in ["user_id","generation_id","created_at","status","credit_cost","generation_type","resolution","duration"])
+    props_train  = pd.read_csv(train_files["props"],   low_memory=False)
+    purch_train  = pd.read_csv(train_files["purch"],   low_memory=False)
+    txn_train    = pd.read_csv(train_files["txn"],     low_memory=False)
+    quizzes_train= pd.read_csv(train_files["quizzes"], low_memory=False)
 
-    print(f"  users={users.shape} props={props.shape} purch={purch.shape}")
-    print(f"  txn={txn.shape} quizzes={quizzes.shape} gens={gens.shape}")
+    test_users   = pd.read_csv(test_files.get("users",  list(test_files.values())[0]), low_memory=False) if "users" in test_files else None
+    gens_test    = pd.read_csv(test_files["gens"],    low_memory=False, usecols=lambda c: c in ["user_id","generation_id","created_at","status","credit_cost","generation_type","resolution","duration"])
+    props_test   = pd.read_csv(test_files["props"],   low_memory=False)
+    purch_test   = pd.read_csv(test_files["purch"],   low_memory=False)
+    txn_test     = pd.read_csv(test_files["txn"],     low_memory=False)
+    quizzes_test = pd.read_csv(test_files["quizzes"], low_memory=False)
+
+    if test_users is None:
+        test_user_ids = pd.DataFrame({"user_id": pd.concat([gens_test["user_id"], props_test["user_id"]]).unique()})
+    else:
+        test_user_ids = test_users[["user_id"]].drop_duplicates()
+
+    print(f"  Train: {users.shape[0]} labeled users")
+    print(f"  Test:  {test_user_ids.shape[0]} users to predict")
 
     print("\n[2/7] Engineering features...")
 
-    gens["created_at"]  = pd.to_datetime(gens["created_at"], errors="coerce", utc=True)
-    gens["credit_cost"] = pd.to_numeric(gens["credit_cost"], errors="coerce").fillna(0)
-    gens["duration"]    = pd.to_numeric(gens["duration"],    errors="coerce").fillna(0)
-    gens["resolution_rank"] = gens["resolution"].map(RESOLUTION_RANK).fillna(0)
+    GEN_COLS = ["user_id","generation_id","created_at","status",
+                "credit_cost","generation_type","resolution","duration"]
 
-    gen_agg = gens.groupby("user_id").agg(
-        gen_count       = ("generation_id",   "count"),
-        completed_count = ("status",          lambda x: (x == "completed").sum()),
-        failed_count    = ("status",          lambda x: (x == "failed").sum()),
-        nsfw_count      = ("status",          lambda x: (x == "nsfw").sum()),
-        avg_credit_cost = ("credit_cost",     "mean"),
-        total_credits   = ("credit_cost",     "sum"),
-        unique_models   = ("generation_type", "nunique"),
-        avg_resolution  = ("resolution_rank", "mean"),
-        max_resolution  = ("resolution_rank", "max"),
-        avg_duration    = ("duration",        "mean"),
-        max_duration    = ("duration",        "max"),
-    ).reset_index()
+    def build_gen_features(gens, props_df):
+        gens = gens[[c for c in GEN_COLS if c in gens.columns]].copy()
+        gens["created_at"]      = pd.to_datetime(gens["created_at"], errors="coerce", utc=True)
+        gens["credit_cost"]     = pd.to_numeric(gens["credit_cost"], errors="coerce").fillna(0)
+        gens["duration"]        = pd.to_numeric(gens["duration"],    errors="coerce").fillna(0)
+        gens["resolution_rank"] = gens["resolution"].map(RESOLUTION_RANK).fillna(0)
 
-    gen_agg["completion_rate"]   = gen_agg["completed_count"] / gen_agg["gen_count"].clip(1)
-    gen_agg["nsfw_rate"]         = gen_agg["nsfw_count"]      / gen_agg["gen_count"].clip(1)
-    gen_agg["fail_rate_gen"]     = gen_agg["failed_count"]    / gen_agg["gen_count"].clip(1)
-    gen_agg["frustration_score"] = (
-        gen_agg["nsfw_count"] * 1.5 + gen_agg["failed_count"] * 1.0
-    ) / gen_agg["gen_count"].clip(1)
+        gen_agg = gens.groupby("user_id").agg(
+            gen_count       = ("generation_id",   "count"),
+            completed_count = ("status",          lambda x: (x == "completed").sum()),
+            failed_count    = ("status",          lambda x: (x == "failed").sum()),
+            nsfw_count      = ("status",          lambda x: (x == "nsfw").sum()),
+            avg_credit_cost = ("credit_cost",     "mean"),
+            total_credits   = ("credit_cost",     "sum"),
+            unique_models   = ("generation_type", "nunique"),
+            avg_resolution  = ("resolution_rank", "mean"),
+            max_resolution  = ("resolution_rank", "max"),
+            avg_duration    = ("duration",        "mean"),
+            max_duration    = ("duration",        "max"),
+        ).reset_index()
 
-    gen_trend = (
-        gens.groupby("user_id")
-        .apply(compute_gen_trend)
-        .reset_index(name="gen_trend")
+        gen_agg["completion_rate"]   = gen_agg["completed_count"] / gen_agg["gen_count"].clip(1)
+        gen_agg["nsfw_rate"]         = gen_agg["nsfw_count"]      / gen_agg["gen_count"].clip(1)
+        gen_agg["fail_rate_gen"]     = gen_agg["failed_count"]    / gen_agg["gen_count"].clip(1)
+        gen_agg["frustration_score"] = (
+            gen_agg["nsfw_count"] * 1.5 + gen_agg["failed_count"] * 1.0
+        ) / gen_agg["gen_count"].clip(1)
+
+        gen_trend_df = (
+            gens.groupby("user_id")
+            .apply(compute_gen_trend)
+            .reset_index(name="gen_trend")
+        )
+        gen_agg = gen_agg.merge(gen_trend_df, on="user_id", how="left")
+
+        props_dates = props_df[["user_id","subscription_start_date"]].copy()
+        props_dates["subscription_start_date"] = pd.to_datetime(
+            props_dates["subscription_start_date"], errors="coerce", utc=True
+        )
+        first_gen  = gens.groupby("user_id")["created_at"].min().reset_index(name="first_gen_date")
+        activation = props_dates.merge(first_gen, on="user_id", how="left")
+        activation["days_to_first_gen"] = (
+            activation["first_gen_date"] - activation["subscription_start_date"]
+        ).dt.days.fillna(14).clip(0, 14)
+        gen_agg = gen_agg.merge(activation[["user_id","days_to_first_gen"]], on="user_id", how="left")
+
+        used_map = (
+            gens.groupby("user_id")["generation_type"]
+            .apply(lambda x: list(x.dropna().unique()))
+            .to_dict()
+        )
+        return gen_agg, gen_trend_df, used_map
+
+    gen_agg_train, gen_trend_train, used_types_map_train = build_gen_features(gens_train, props_train)
+    gen_agg_test,  gen_trend_test,  used_types_map_test  = build_gen_features(gens_test,  props_test)
+
+    def build_purch_features(purch):
+        return purch.groupby("user_id").agg(
+            total_purchases = ("transaction_id",          "count"),
+            lifetime_spend  = ("purchase_amount_dollars", "sum"),
+            avg_purchase    = ("purchase_amount_dollars", "mean"),
+            sub_creates     = ("purchase_type", lambda x: (x == "Subscription Create").sum()),
+            sub_updates     = ("purchase_type", lambda x: (x == "Subscription Update").sum()),
+            credit_packs    = ("purchase_type", lambda x: (x == "Credits package").sum()),
+        ).reset_index()
+
+    purch_agg_train = build_purch_features(purch_train)
+    purch_agg_test  = build_purch_features(purch_test)
+
+    def build_txn_features(txn):
+        txn = txn.copy()
+        txn["bank_country_tier"]    = txn["bank_country"].apply(country_tier)
+        txn["billing_country_tier"] = txn["billing_address_country"].apply(country_tier)
+        txn["cvc_pass"]    = txn["cvc_check"].eq("pass").astype(int)
+        txn["cvc_missing"] = txn["cvc_check"].isin(["not_provided","unavailable"]).astype(int)
+        txn["secure_fail"] = (
+            txn["card_3d_secure_support"].eq("recommended") &
+            txn["is_3d_secure_authenticated"].astype(str).str.lower().eq("false")
+        ).astype(int)
+        txn["uses_wallet"] = txn["digital_wallet"].ne("none").astype(int)
+        txn["mismatch"]    = (txn["billing_address_country"] != txn["card_country"]).astype(int)
+
+        txn_agg = txn.groupby("user_id").agg(
+            txn_count            = ("transaction_id",      "count"),
+            fail_count           = ("failure_code",        lambda x: x.notna().sum()),
+            total_spend_txn      = ("amount_in_usd",       "sum"),
+            avg_spend_txn        = ("amount_in_usd",       "mean"),
+            bank_country_tier    = ("bank_country_tier",   "max"),
+            billing_country_tier = ("billing_country_tier","max"),
+            is_business          = ("is_business",  lambda x: x.astype(str).str.lower().eq("true").any()),
+            is_virtual           = ("is_virtual",   lambda x: x.astype(str).str.lower().eq("true").any()),
+            has_prepaid          = ("is_prepaid",   lambda x: x.astype(str).str.lower().eq("true").any()),
+            has_debit            = ("card_funding", lambda x: x.eq("debit").any()),
+            cvc_pass_rate        = ("cvc_pass",     "mean"),
+            cvc_missing_rate     = ("cvc_missing",  "mean"),
+            has_secure_fail      = ("secure_fail",  "max"),
+            uses_wallet          = ("uses_wallet",  "max"),
+            card_country_mismatch= ("mismatch",     "max"),
+        ).reset_index()
+
+        txn_agg["payment_fail_rate"] = txn_agg["fail_count"] / txn_agg["txn_count"].clip(1)
+        for col in ["is_business","is_virtual","has_prepaid","has_debit",
+                    "has_secure_fail","uses_wallet","card_country_mismatch"]:
+            txn_agg[col] = txn_agg[col].astype(int)
+
+        country_fail = (
+            txn.groupby("billing_address_country")["failure_code"]
+            .apply(lambda x: x.notna().mean())
+            .reset_index(name="country_fail_rate")
+        )
+        high_risk = set(
+            country_fail.loc[
+                country_fail["country_fail_rate"] > country_fail["country_fail_rate"].mean(),
+                "billing_address_country"
+            ]
+        )
+        txn["high_risk_country"] = txn["billing_address_country"].isin(high_risk).astype(int)
+        hr_agg = txn.groupby("user_id")["high_risk_country"].max().reset_index()
+        txn_agg = txn_agg.merge(hr_agg, on="user_id", how="left")
+        return txn_agg
+
+    txn_agg_train = build_txn_features(txn_train)
+
+    txn_test_linked = txn_test.merge(
+        purch_test[["user_id","transaction_id"]], on="transaction_id", how="left"
     )
-    gen_agg = gen_agg.merge(gen_trend, on="user_id", how="left")
+    txn_agg_test = build_txn_features(txn_test_linked)
 
-    props_dates = props[["user_id","subscription_start_date"]].copy()
-    props_dates["subscription_start_date"] = pd.to_datetime(
-        props_dates["subscription_start_date"], errors="coerce", utc=True
-    )
-    first_gen  = gens.groupby("user_id")["created_at"].min().reset_index(name="first_gen_date")
-    activation = props_dates.merge(first_gen, on="user_id", how="left")
-    activation["days_to_first_gen"] = (
-        activation["first_gen_date"] - activation["subscription_start_date"]
-    ).dt.days.fillna(14).clip(0, 14)
-    gen_agg = gen_agg.merge(activation[["user_id","days_to_first_gen"]], on="user_id", how="left")
+    def build_quiz_features(quizzes):
+        q = quizzes.drop_duplicates(subset="user_id", keep="first")
+        agg = q[["user_id"]].copy()
+        agg["quiz_high_cost"]    = q["frustration"].isin(FRUSTRATION.high_cost).astype(int)
+        agg["quiz_hard_prompt"]  = q["frustration"].isin(FRUSTRATION.hard_prompt).astype(int)
+        agg["quiz_inconsistent"] = q["frustration"].isin(FRUSTRATION.inconsistent).astype(int)
+        agg["quiz_limited"]      = q["frustration"].isin(FRUSTRATION.limited).astype(int)
+        agg["is_beginner"]       = (q["experience"] == "beginner").astype(int)
+        agg["is_expert"]         = q["experience"].isin(["advanced","expert"]).astype(int)
+        agg["is_invited"]        = (q["flow_type"] == "invited").astype(int)
+        agg["is_personal"]       = (q["flow_type"] == "personal").astype(int)
+        agg["usage_limited"]     = (q["usage_plan"] == "limited").astype(int)
+        agg["wants_video"]       = q["first_feature"].str.contains(
+            "video|Video|cinema|Cinema|commercial|Commercial|viral|Viral", na=False).astype(int)
+        agg["is_filmmaker_role"] = q["role"].str.contains(
+            "film|Film|cinema|Cinema|creator|Creator|director|Director", na=False).astype(int)
+        agg["from_youtube"]   = (q["source"] == "youtube").astype(int)
+        agg["from_twitter"]   = (q["source"] == "twitter").astype(int)
+        agg["from_instagram"] = (q["source"] == "instagram").astype(int)
+        agg["team_size_num"]  = q["team_size"].map(TEAM_SIZE).fillna(1)
+        raw = q.set_index("user_id")[["frustration","first_feature","role","experience"]].to_dict("index")
+        return agg, raw
 
-    used_types_map: Dict[str, List[str]] = (
-        gens.groupby("user_id")["generation_type"]
-        .apply(lambda x: list(x.dropna().unique()))
-        .to_dict()
-    )
+    quiz_agg_train, quiz_raw_train = build_quiz_features(quizzes_train)
+    quiz_agg_test,  quiz_raw_test  = build_quiz_features(quizzes_test)
 
-    purch_agg = purch.groupby("user_id").agg(
-        total_purchases = ("transaction_id",          "count"),
-        lifetime_spend  = ("purchase_amount_dollars", "sum"),
-        avg_purchase    = ("purchase_amount_dollars", "mean"),
-        sub_creates     = ("purchase_type", lambda x: (x == "Subscription Create").sum()),
-        sub_updates     = ("purchase_type", lambda x: (x == "Subscription Update").sum()),
-        credit_packs    = ("purchase_type", lambda x: (x == "Credits package").sum()),
-    ).reset_index()
+    def build_props_features(props):
+        p = props.copy()
+        p["plan_tier"]         = p["subscription_plan"].map(PLAN_TIER).fillna(1)
+        p["user_country_tier"] = p["country_code"].apply(country_tier)
+        return p
 
-    txn["bank_country_tier"]    = txn["bank_country"].apply(country_tier)
-    txn["billing_country_tier"] = txn["billing_address_country"].apply(country_tier)
-    txn["cvc_pass"]    = txn["cvc_check"].eq("pass").astype(int)
-    txn["cvc_missing"] = txn["cvc_check"].isin(["not_provided","unavailable"]).astype(int)
-    txn["secure_fail"] = (
-        txn["card_3d_secure_support"].eq("recommended") &
-        txn["is_3d_secure_authenticated"].astype(str).str.lower().eq("false")
-    ).astype(int)
-    txn["uses_wallet"] = txn["digital_wallet"].ne("none").astype(int)
-    txn["mismatch"]    = (txn["billing_address_country"] != txn["card_country"]).astype(int)
+    props_train_f = build_props_features(props_train)
+    props_test_f  = build_props_features(props_test)
 
-    txn_agg = txn.groupby("user_id").agg(
-        txn_count            = ("transaction_id",      "count"),
-        fail_count           = ("failure_code",        lambda x: x.notna().sum()),
-        total_spend_txn      = ("amount_in_usd",       "sum"),
-        avg_spend_txn        = ("amount_in_usd",       "mean"),
-        bank_country_tier    = ("bank_country_tier",   "max"),
-        billing_country_tier = ("billing_country_tier","max"),
-        is_business          = ("is_business",  lambda x: x.astype(str).str.lower().eq("true").any()),
-        is_virtual           = ("is_virtual",   lambda x: x.astype(str).str.lower().eq("true").any()),
-        has_prepaid          = ("is_prepaid",   lambda x: x.astype(str).str.lower().eq("true").any()),
-        has_debit            = ("card_funding", lambda x: x.eq("debit").any()),
-        cvc_pass_rate        = ("cvc_pass",     "mean"),
-        cvc_missing_rate     = ("cvc_missing",  "mean"),
-        has_secure_fail      = ("secure_fail",  "max"),
-        uses_wallet          = ("uses_wallet",  "max"),
-        card_country_mismatch= ("mismatch",     "max"),
-    ).reset_index()
+    print("\n[3/7] Merging feature tables...")
 
-    txn_agg["payment_fail_rate"] = txn_agg["fail_count"] / txn_agg["txn_count"].clip(1)
-    for col in ["is_business","is_virtual","has_prepaid","has_debit",
-                "has_secure_fail","uses_wallet","card_country_mismatch"]:
-        txn_agg[col] = txn_agg[col].astype(int)
+    def merge_features(base_df, purch_agg, txn_agg, quiz_agg, props_f, gen_agg, gen_trend_df):
+        df = base_df.copy()
+        for frame in [
+            purch_agg,
+            txn_agg,
+            quiz_agg,
+            props_f[["user_id","plan_tier","user_country_tier"]],
+            gen_agg.drop(columns=["gen_trend"], errors="ignore"),
+            gen_trend_df,
+        ]:
+            df = df.merge(frame, on="user_id", how="left")
+        return df.reset_index(drop=True).fillna(0)
 
-    country_fail = (
-        txn.groupby("billing_address_country")["failure_code"]
-        .apply(lambda x: x.notna().mean())
-        .reset_index(name="country_fail_rate")
-    )
-    high_risk_countries = set(
-        country_fail.loc[
-            country_fail["country_fail_rate"] > country_fail["country_fail_rate"].mean(),
-            "billing_address_country"
-        ]
-    )
-    txn["high_risk_country"] = txn["billing_address_country"].isin(high_risk_countries).astype(int)
-    hr_agg = txn.groupby("user_id")["high_risk_country"].max().reset_index()
-    txn_agg = txn_agg.merge(hr_agg, on="user_id", how="left")
+    df_train = merge_features(users, purch_agg_train, txn_agg_train,
+                              quiz_agg_train, props_train_f,
+                              gen_agg_train, gen_trend_train)
 
-    quizzes_dedup = quizzes.drop_duplicates(subset="user_id", keep="first")
-    quiz_agg = quizzes_dedup[["user_id"]].copy()
-    quiz_agg["quiz_high_cost"]    = quizzes_dedup["frustration"].isin(FRUSTRATION.high_cost).astype(int)
-    quiz_agg["quiz_hard_prompt"]  = quizzes_dedup["frustration"].isin(FRUSTRATION.hard_prompt).astype(int)
-    quiz_agg["quiz_inconsistent"] = quizzes_dedup["frustration"].isin(FRUSTRATION.inconsistent).astype(int)
-    quiz_agg["quiz_limited"]      = quizzes_dedup["frustration"].isin(FRUSTRATION.limited).astype(int)
-    quiz_agg["is_beginner"]       = (quizzes_dedup["experience"] == "beginner").astype(int)
-    quiz_agg["is_expert"]         = quizzes_dedup["experience"].isin(["advanced","expert"]).astype(int)
-    quiz_agg["is_invited"]        = (quizzes_dedup["flow_type"] == "invited").astype(int)
-    quiz_agg["is_personal"]       = (quizzes_dedup["flow_type"] == "personal").astype(int)
-    quiz_agg["usage_limited"]     = (quizzes_dedup["usage_plan"] == "limited").astype(int)
-    quiz_agg["wants_video"]       = quizzes_dedup["first_feature"].str.contains(
-        "video|Video|cinema|Cinema|commercial|Commercial|viral|Viral", na=False).astype(int)
-    quiz_agg["is_filmmaker_role"] = quizzes_dedup["role"].str.contains(
-        "film|Film|cinema|Cinema|creator|Creator|director|Director", na=False).astype(int)
-    quiz_agg["from_youtube"]   = (quizzes_dedup["source"] == "youtube").astype(int)
-    quiz_agg["from_twitter"]   = (quizzes_dedup["source"] == "twitter").astype(int)
-    quiz_agg["from_instagram"] = (quizzes_dedup["source"] == "instagram").astype(int)
-    quiz_agg["team_size_num"]  = quizzes_dedup["team_size"].map(TEAM_SIZE).fillna(1)
 
-    quiz_raw: Dict[str, dict] = quizzes_dedup.set_index("user_id")[
-        ["frustration","first_feature","role","experience"]
-    ].to_dict("index")
+    df_test = merge_features(test_user_ids, purch_agg_test, txn_agg_test,
+                             quiz_agg_test, props_test_f,
+                             gen_agg_test, gen_trend_test)
 
-    props["plan_tier"]        = props["subscription_plan"].map(PLAN_TIER).fillna(1)
-    props["user_country_tier"]= props["country_code"].apply(country_tier)
-
-    print("\n[3/7] Merging feature table...")
-    df = users.copy()
-    for frame in [
-        purch_agg,
-        txn_agg,
-        quiz_agg,
-        props[["user_id","plan_tier","user_country_tier"]],
-        gen_agg.drop(columns=["gen_trend"], errors="ignore"),
-        gen_trend,
-    ]:
-        df = df.merge(frame, on="user_id", how="left")
-
-    df = df.reset_index(drop=True).fillna(0)
-    active_features = [f for f in FEATURES if f in df.columns]
-    print(f"  Shape: {df.shape}  |  Active features: {len(active_features)}")
-    print(f"  Labels:\n{df['churn_status'].value_counts().to_string()}")
+    active_features = [f for f in FEATURES if f in df_train.columns]
+    print(f"  Train shape: {df_train.shape} | Features: {len(active_features)}")
+    print(f"  Test shape:  {df_test.shape}")
+    print(f"  Labels:\n{df_train['churn_status'].value_counts().to_string()}")
 
     print("\n[4/7] Training models...")
 
-    df["churned"]  = (df["churn_status"] != ChurnType.NOT_CHURNED).astype(int)
-    df["is_invol"] = (df["churn_status"] == ChurnType.INVOL_CHURN).astype(int)
+    df_train["churned"]  = (df_train["churn_status"] != ChurnType.NOT_CHURNED).astype(int)
+    df_train["is_invol"] = (df_train["churn_status"] == ChurnType.INVOL_CHURN).astype(int)
 
-    X  = df[active_features]
-    y1 = df["churned"]
+    X      = df_train[active_features]
+    X_test = df_test[active_features]
+    y1     = df_train["churned"]
 
     X_tr, X_te, y_tr, y_te = train_test_split(
         X, y1, test_size=0.2, random_state=42, stratify=y1
@@ -709,8 +807,9 @@ def main() -> None:
     print(f"  Macro F1:      {f1_score(y_te, y_pred1_tuned, average='macro'):.4f}")
     print(f"  Churn F1:      {f1_score(y_te, y_pred1_tuned, average='binary'):.4f}  ← churn class only")
 
-    ch_mask = df["churned"] == 1
-    X2, y2  = df.loc[ch_mask, active_features], df.loc[ch_mask, "is_invol"]
+    ch_mask = df_train["churned"] == 1
+    X2 = df_train.loc[ch_mask, active_features]
+    y2 = df_train.loc[ch_mask, "is_invol"]
     X2_tr, X2_te, y2_tr, y2_te = train_test_split(
         X2, y2, test_size=0.2, random_state=42, stratify=y2
     )
@@ -737,7 +836,7 @@ def main() -> None:
 
     explainer = shap.TreeExplainer(model1_base)
     shap_te   = explainer.shap_values(X_te)
-    shap_all  = explainer.shap_values(X)
+    shap_all  = explainer.shap_values(X_test)
 
     plt.figure(figsize=(10, 8))
     shap.summary_plot(shap_te, X_te, feature_names=active_features, show=False)
@@ -748,27 +847,28 @@ def main() -> None:
     print("  Saved: shap_summary.png")
 
     print("\n[6/7] Generating predictions...")
-    df["churn_prob"] = model1.predict_proba(X)[:, 1]
-    df["churn_type"] = ChurnType.NOT_CHURNED.value
+    df_test["churn_prob"] = model1.predict_proba(X_test)[:, 1]
+    df_test["churn_type"] = ChurnType.NOT_CHURNED.value
 
-    at_risk = df["churn_prob"] >= best_threshold
-    invol_p = model2.predict_proba(df.loc[at_risk, active_features])[:, 1]
-    df.loc[at_risk, "churn_type"] = np.where(
+    at_risk = df_test["churn_prob"] >= best_threshold
+    invol_p = model2.predict_proba(df_test.loc[at_risk, active_features])[:, 1]
+    df_test.loc[at_risk, "churn_type"] = np.where(
         invol_p > 0.5, ChurnType.INVOL_CHURN.value, ChurnType.VOL_CHURN.value
     )
-    print(f"  Distribution:\n{df['churn_type'].value_counts().to_string()}")
+    print(f"  Distribution:\n{df_test['churn_type'].value_counts().to_string()}")
 
     print("\n[7/7] Building submission...")
-    max_purchases = max(df["total_purchases"].max(), 1)
+    max_purchases = max(df_train["total_purchases"].max(), 1)
 
     output_rows: List[PredictionRow] = []
+    max_purchases = max(df_train["total_purchases"].max(), 1)
 
-    for idx, row in df.iterrows():
+    for idx, row in df_test.iterrows():
         r     = row.to_dict()
         uid   = row["user_id"]
         ctype = row["churn_type"]
 
-        reasons  = get_shap_reasons(idx, shap_all, X)
+        reasons  = get_shap_reasons(idx, shap_all, X_test)
         discount = None
         action   = ""
 
@@ -777,12 +877,12 @@ def main() -> None:
             action   = build_invol_action(r, discount)
 
         elif ctype == ChurnType.VOL_CHURN.value:
-            q = quiz_raw.get(uid, {})
+            q = quiz_raw_test.get(uid, {})
             profile = UserProfile(
                 role        = str(q.get("role", "")).strip().lower(),
                 first_feat  = str(q.get("first_feature", "")) if q.get("first_feature") else "",
                 experience  = str(q.get("experience", "")).strip().lower(),
-                used_models = used_types_map.get(uid, []),
+                used_models = used_types_map_test.get(uid, []),
             )
             action = build_vol_action(profile, r)
 
@@ -801,20 +901,19 @@ def main() -> None:
     submission = pd.DataFrame([r.to_dict() for r in output_rows])
     submission.to_csv("predictions.csv", index=False)
 
+    submit = pd.DataFrame({
+        "user_id":      submission["user_id"],
+        "churn_status": submission["churn_type"],
+    })
+    submit_filename = "Общество_Гение_submission.csv"
+    submit.to_csv(submit_filename, index=False)
+
     print(f"\n  Saved: predictions.csv ({len(submission)} rows)")
-    print("\n  Sample invol:")
-    for _, r in submission[submission["churn_type"] == ChurnType.INVOL_CHURN.value].head(3).iterrows():
-        print(f"    prob={r['churn_probability']}  disc={r['discount_pct']}%")
-        print(f"    {r['reason_1']}")
-        print(f"    {r['recommended_action'][:90]}")
-        print()
-    print("  Sample vol:")
-    for _, r in submission[submission["churn_type"] == ChurnType.VOL_CHURN.value].head(3).iterrows():
-        print(f"    prob={r['churn_probability']}")
-        print(f"    {r['reason_1']}")
-        print(f"    {r['recommended_action'][:90]}")
-        print()
-    print("Done.")
+    print(f"  Saved: {submit_filename} ({len(submit)} rows)")
+    print(f"  churn_status distribution:\n{submit['churn_status'].value_counts().to_string()}")
+    print("\n  Sample predictions:")
+    print(submit.head(10).to_string(index=False))
+    print("\nDone.")
 
 if __name__ == "__main__":
     main()
