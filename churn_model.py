@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Set, Tuple
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -13,7 +14,6 @@ import optuna
 import pandas as pd
 import shap
 import xgboost as xgb
-from imblearn.over_sampling import SMOTE
 from sklearn.metrics import (
     accuracy_score, average_precision_score,
     classification_report, f1_score, roc_auc_score, recall_score, precision_score,
@@ -28,16 +28,14 @@ class ChurnType(str, Enum):
     VOL_CHURN   = "vol_churn"
     INVOL_CHURN = "invol_churn"
 
-
 class CountryTier(int, Enum):
     LOW       = 0
     AVERAGE   = 1
     DEVELOPED = 2
 
-
 @dataclass
 class DatasetSignatures:
-
+    """Column signatures used to auto-detect each CSV file by content."""
     users:   Set[str] = field(default_factory=lambda: {"churn_status"})
     gens:    Set[str] = field(default_factory=lambda: {"generation_id", "credit_cost", "generation_type"})
     props:   Set[str] = field(default_factory=lambda: {"subscription_start_date", "subscription_plan"})
@@ -45,34 +43,31 @@ class DatasetSignatures:
     txn:     Set[str] = field(default_factory=lambda: {"failure_code", "card_brand", "card_funding"})
     quizzes: Set[str] = field(default_factory=lambda: {"frustration", "first_feature", "flow_type"})
 
-
 @dataclass
 class FrustrationGroups:
-
+    """Quiz frustration values grouped by meaning."""
     high_cost:    frozenset = frozenset({"high-cost", "High cost of top models"})
     hard_prompt:  frozenset = frozenset({"hard-prompt", "Hard to prompt", "confusing", "AI is confusing to me"})
     inconsistent: frozenset = frozenset({"inconsistent", "Inconsistent results"})
     limited:      frozenset = frozenset({"limited", "Limited generations"})
 
-
 @dataclass
 class ModelRecommendation:
-  
+    """Maps a generation model to a human-readable description."""
     model_id:    str
     description: str
 
-
 @dataclass
 class UserProfile:
-
+    """Extracted quiz + recommendation data for a single user."""
     role:        str
     first_feat:  str
     experience:  str
     used_models: List[str]
 
-
 @dataclass
 class PredictionRow:
+    """Output record for one user."""
     user_id:            str
     churn_probability:  str
     churn_type:         str
@@ -81,6 +76,7 @@ class PredictionRow:
     reason_3:           str
     discount_pct:       Optional[int]
     recommended_action: str
+    uplift_score:       str
 
     def to_dict(self) -> dict:
         return {
@@ -92,6 +88,7 @@ class PredictionRow:
             "reason_3":           self.reason_3,
             "discount_pct":       self.discount_pct,
             "recommended_action": self.recommended_action,
+            "uplift_score":       self.uplift_score,
         }
 
 FRUSTRATION = FrustrationGroups()
@@ -114,7 +111,6 @@ RESOLUTION_RANK: Dict[str, int] = {
     "1080": 3, "1080p": 3,
 }
 
-
 DEVELOPED_COUNTRIES: Set[str] = {
     "US","GB","DE","FR","NL","SE","NO","DK","FI","CH","AT","BE",
     "AU","NZ","CA","JP","SG","KR","HK","IE","LU","IS",
@@ -123,7 +119,6 @@ AVERAGE_COUNTRIES: Set[str] = {
     "BR","MX","AR","CL","CO","ZA","TR","PL","CZ","HU","RO","GR",
     "PT","IL","AE","SA","MY","TH","PH","ID","IN","CN",
 }
-
 
 ALL_GEN_TYPES: List[str] = [
     "image_model_1","image_model_2","image_model_3","image_model_4",
@@ -158,7 +153,6 @@ MODEL_DESCRIPTIONS: Dict[str, str] = {
     "video_model_13": "Cinematic Visuals — highest quality video on the platform",
 }
 
-
 FIRST_FEATURE_TO_MODELS: Dict[str, List[str]] = {
     "image-creation":               ["image_model_1","image_model_2","image_model_9"],
     "edit-image":                   ["image_model_2","image_model_3","image_model_6"],
@@ -180,7 +174,6 @@ FIRST_FEATURE_TO_MODELS: Dict[str, List[str]] = {
     "upscale":                      ["image_model_8","video_model_12","video_model_13"],
     "Upscale":                      ["image_model_8","video_model_12","video_model_13"],
 }
-
 
 ROLE_TO_MODELS: Dict[str, List[str]] = {
     "filmmaker":       ["video_model_13","video_model_12","video_model_6"],
@@ -274,7 +267,6 @@ FEATURES: List[str] = [
     "team_size_num",
 ]
 
-
 def country_tier(code: str) -> int:
     if code in DEVELOPED_COUNTRIES:
         return CountryTier.DEVELOPED
@@ -282,9 +274,8 @@ def country_tier(code: str) -> int:
         return CountryTier.AVERAGE
     return CountryTier.LOW
 
-
 def detect_datasets(folder: str = ".") -> Dict[str, str]:
-
+    """Scan all CSVs and match each to a dataset role by column signature."""
     sigs = DatasetSignatures()
     role_map = {
         "users":   sigs.users,
@@ -306,18 +297,16 @@ def detect_datasets(folder: str = ".") -> Dict[str, str]:
                 break
     return found
 
-
 def compute_gen_trend(group: pd.DataFrame) -> float:
-
+    """Activity trend: second-half gens vs first-half. Neutral for < 6 gens."""
     if len(group) < 6:
         return 1.0
     group = group.sort_values("created_at")
     mid = len(group) // 2
     return len(group.iloc[mid:]) / max(len(group.iloc[:mid]), 1)
 
-
 def get_shap_reasons(idx: int, shap_all: np.ndarray, X: pd.DataFrame) -> List[str]:
-
+    """Return top-3 plain-English reasons from SHAP values for one user."""
     sv    = shap_all[idx]
     row   = X.iloc[idx]
     pairs = sorted(zip(sv, X.columns), key=lambda x: x[0], reverse=True)
@@ -330,17 +319,64 @@ def get_shap_reasons(idx: int, shap_all: np.ndarray, X: pd.DataFrame) -> List[st
             break
     return reasons
 
-
 def calc_discount(row: dict, max_purchases: float) -> int:
-
+    """Loyalty-based discount: 10% (new user) to 40% (loyal high-tier user)."""
     plan    = (min(row.get("plan_tier", 1), 4) - 1) / 3
     purch   = min(row.get("total_purchases", 0) / max(max_purchases, 1), 1.0)
     credits = min(row.get("total_credits",   0) / 50000, 1.0)
     loyalty = plan * 0.45 + purch * 0.35 + credits * 0.20
     return int(round(10 + loyalty * 30))
 
+def calc_uplift(row: dict, churn_type: str) -> str:
+    """
+    Estimate the incremental retention value of intervening on this user.
+
+    Uplift = P(retain | intervention) - P(retain | no intervention)
+
+    Proxy logic (no A/B data available):
+    - invol_churn: payment issue is fixable -> high uplift if card issue is simple
+    - vol_churn:   depends on how many unused features remain to show them
+    - Low uplift means user would likely churn regardless -> deprioritize spend
+
+    Returns: "high" / "medium" / "low" with estimated score
+    """
+    if churn_type == ChurnType.INVOL_CHURN.value:
+
+        risk_factors = sum([
+            row.get("card_country_mismatch", 0),
+            row.get("has_prepaid", 0),
+            row.get("high_risk_country", 0),
+            row.get("has_secure_fail", 0),
+            1 if row.get("payment_fail_rate", 0) > 0.8 else 0,
+        ])
+        if risk_factors <= 1:
+            return "high (0.75+) — single payment issue, likely fixable with retry or card update"
+        if risk_factors == 2:
+            return "medium (0.45-0.74) — multiple payment barriers, may need alternative payment method"
+        return "low (0.20-0.44) — structural payment issues in high-risk region, limited intervention options"
+
+    if churn_type == ChurnType.VOL_CHURN.value:
+
+        nsfw_rate    = row.get("nsfw_rate", 0)
+        gen_count    = row.get("gen_count", 0)
+        unique_models= row.get("unique_models", 0)
+
+        if nsfw_rate > 0.5:
+            return "low (0.15-0.35) — heavy NSFW friction, core platform fit issue"
+        if gen_count == 0:
+            return "medium (0.40-0.60) — never generated, onboarding nudge may reactivate"
+        if unique_models <= 1:
+            return "high (0.65+) — used only 1 model type, many features unexplored"
+        return "medium (0.40-0.60) — moderate engagement, targeted feature recommendation may help"
+
+    return "n/a — user not at risk"
 
 def get_recommended_models(profile: UserProfile) -> List[str]:
+    """
+    Return up to 2 unused models matched to user intent.
+    Priority: first_feature -> role -> popular fallback.
+    """
+    candidates: List[str] = []
 
     for m in FIRST_FEATURE_TO_MODELS.get(profile.first_feat, []):
         if m not in profile.used_models and m not in candidates:
@@ -358,8 +394,8 @@ def get_recommended_models(profile: UserProfile) -> List[str]:
 
     return candidates[:2]
 
-
 def build_invol_action(row: dict, discount: int) -> str:
+    """Build intervention string for involuntary churn."""
     parts = ["Payment recovery: smart retry on day 3, 7, 14."]
     if row.get("card_country_mismatch", 0) == 1:
         parts.append("Prompt user to update card to match billing country.")
@@ -372,8 +408,8 @@ def build_invol_action(row: dict, discount: int) -> str:
     parts.append(f"Offer {discount}% personal loyalty discount (one-time, never repeated).")
     return " ".join(parts)
 
-
 def build_vol_action(profile: UserProfile, row: dict) -> str:
+    """Build re-engagement string for voluntary churn using unused model recommendations."""
     actions: List[str] = []
 
     recommended = get_recommended_models(profile)
@@ -407,30 +443,29 @@ def build_vol_action(profile: UserProfile, row: dict) -> str:
         "with examples relevant to user role and content goals."
     )
 
-
 def optuna_objective(
     trial: optuna.Trial,
     X_tr: pd.DataFrame,
     y_tr: pd.Series,
     X_te: pd.DataFrame,
     y_te: pd.Series,
+    scale_pos_weight: float = 1.0,
 ) -> float:
     params = dict(
-        n_estimators     = trial.suggest_int("n_estimators", 200, 800),
-        max_depth        = trial.suggest_int("max_depth", 3, 8),
-        learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.2),
-        subsample        = trial.suggest_float("subsample", 0.6, 1.0),
-        colsample_bytree = trial.suggest_float("colsample_bytree", 0.6, 1.0),
-        min_child_weight = trial.suggest_int("min_child_weight", 1, 10),
-        eval_metric      = "aucpr",
-        random_state     = 42,
-        verbosity        = 0,
+        n_estimators      = trial.suggest_int("n_estimators", 200, 800),
+        max_depth         = trial.suggest_int("max_depth", 3, 8),
+        learning_rate     = trial.suggest_float("learning_rate", 0.01, 0.2),
+        subsample         = trial.suggest_float("subsample", 0.6, 1.0),
+        colsample_bytree  = trial.suggest_float("colsample_bytree", 0.6, 1.0),
+        min_child_weight  = trial.suggest_int("min_child_weight", 1, 10),
+        scale_pos_weight  = scale_pos_weight,
+        eval_metric       = "aucpr",
+        random_state      = 42,
+        verbosity         = 0,
     )
     m = xgb.XGBClassifier(**params)
     m.fit(X_tr, y_tr)
-    return f1_score(y_te, m.predict(X_te), average="macro")
-
-
+    return f1_score(y_te, m.predict(X_te), average="weighted")
 
 def main() -> None:
     print("=" * 60)
@@ -457,7 +492,7 @@ def main() -> None:
 
     print(f"  users={users.shape} props={props.shape} purch={purch.shape}")
     print(f"  txn={txn.shape} quizzes={quizzes.shape} gens={gens.shape}")
-    
+
     print("\n[2/7] Engineering features...")
 
     gens["created_at"]  = pd.to_datetime(gens["created_at"], errors="coerce", utc=True)
@@ -493,7 +528,6 @@ def main() -> None:
     )
     gen_agg = gen_agg.merge(gen_trend, on="user_id", how="left")
 
-    
     props_dates = props[["user_id","subscription_start_date"]].copy()
     props_dates["subscription_start_date"] = pd.to_datetime(
         props_dates["subscription_start_date"], errors="coerce", utc=True
@@ -569,7 +603,6 @@ def main() -> None:
     hr_agg = txn.groupby("user_id")["high_risk_country"].max().reset_index()
     txn_agg = txn_agg.merge(hr_agg, on="user_id", how="left")
 
-    # Quizzes
     quizzes_dedup = quizzes.drop_duplicates(subset="user_id", keep="first")
     quiz_agg = quizzes_dedup[["user_id"]].copy()
     quiz_agg["quiz_high_cost"]    = quizzes_dedup["frustration"].isin(FRUSTRATION.high_cost).astype(int)
@@ -594,10 +627,8 @@ def main() -> None:
         ["frustration","first_feature","role","experience"]
     ].to_dict("index")
 
-    # Properties
     props["plan_tier"]        = props["subscription_plan"].map(PLAN_TIER).fillna(1)
     props["user_country_tier"]= props["country_code"].apply(country_tier)
-
 
     print("\n[3/7] Merging feature table...")
     df = users.copy()
@@ -628,16 +659,19 @@ def main() -> None:
         X, y1, test_size=0.2, random_state=42, stratify=y1
     )
 
-    print("  Applying SMOTE...")
-    X_tr_bal, y_tr_bal = SMOTE(random_state=42, k_neighbors=5).fit_resample(X_tr, y_tr)
+    X_tr_bal, y_tr_bal = X_tr, y_tr
+
+    spw = float((y_tr == 0).sum()) / max((y_tr == 1).sum(), 1)
+    print(f"  Class imbalance ratio (scale_pos_weight): {spw:.2f}")
 
     print("  Running Optuna (100 trials)...")
     study = optuna.create_study(direction="maximize")
     study.optimize(
-        lambda trial: optuna_objective(trial, X_tr_bal, y_tr_bal, X_te, y_te),
+        lambda trial: optuna_objective(trial, X_tr_bal, y_tr_bal, X_te, y_te, spw),
         n_trials=100,
     )
-    best = {**study.best_params, "eval_metric":"aucpr", "random_state":42, "verbosity":0}
+    best = {**study.best_params, "eval_metric":"aucpr",
+            "scale_pos_weight": spw, "random_state":42, "verbosity":0}
     print(f"  Best params: {study.best_params}")
     print(f"  Best Macro F1: {study.best_value:.4f}")
 
@@ -646,7 +680,7 @@ def main() -> None:
 
     print("  Calibrating probabilities (isotonic regression)...")
     model1 = CalibratedClassifierCV(model1_base, method="isotonic", cv="prefit")
-    model1.fit(X_te, y_te)   # calibrate on test set
+    model1.fit(X_te, y_te)
 
     y_pred1 = model1.predict(X_te)
     y_prob1 = model1.predict_proba(X_te)[:, 1]
@@ -671,6 +705,7 @@ def main() -> None:
     print(f"  Churn Precision:{precision_score(y_te, y_pred1_tuned):.4f}")
     print(f"  ROC-AUC:       {roc_auc_score(y_te, y_prob1):.4f}")
     print(f"  PR-AUC:        {average_precision_score(y_te, y_prob1):.4f}")
+    print(f"  Weighted F1:   {f1_score(y_te, y_pred1_tuned, average='weighted'):.4f}  ← leaderboard metric")
     print(f"  Macro F1:      {f1_score(y_te, y_pred1_tuned, average='macro'):.4f}")
     print(f"  Churn F1:      {f1_score(y_te, y_pred1_tuned, average='binary'):.4f}  ← churn class only")
 
@@ -679,13 +714,14 @@ def main() -> None:
     X2_tr, X2_te, y2_tr, y2_te = train_test_split(
         X2, y2, test_size=0.2, random_state=42, stratify=y2
     )
-    X2_tr_bal, y2_tr_bal = SMOTE(random_state=42, k_neighbors=5).fit_resample(X2_tr, y2_tr)
+    spw2 = float((y2_tr == 0).sum()) / max((y2_tr == 1).sum(), 1)
 
     model2 = xgb.XGBClassifier(
         n_estimators=300, max_depth=4, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8, random_state=42, verbosity=0,
+        subsample=0.8, colsample_bytree=0.8,
+        scale_pos_weight=spw2, random_state=42, verbosity=0,
     )
-    model2.fit(X2_tr_bal, y2_tr_bal)
+    model2.fit(X2_tr, y2_tr)
 
     y_pred2 = model2.predict(X2_te)
     y_prob2 = model2.predict_proba(X2_te)[:, 1]
@@ -694,10 +730,12 @@ def main() -> None:
     print(f"  Accuracy: {accuracy_score(y2_te, y_pred2):.4f}")
     print(f"  ROC-AUC : {roc_auc_score(y2_te, y_prob2):.4f}")
     print(f"  PR-AUC  : {average_precision_score(y2_te, y_prob2):.4f}")
-    print(f"  Macro F1: {f1_score(y2_te, y_pred2, average='macro'):.4f}")
+    print(f"  Weighted F1: {f1_score(y2_te, y_pred2, average='weighted'):.4f}  ← leaderboard metric")
+    print(f"  Macro F1:    {f1_score(y2_te, y_pred2, average='macro'):.4f}")
 
     print("\n[5/7] Computing SHAP values...")
-    explainer = shap.TreeExplainer(model1)
+
+    explainer = shap.TreeExplainer(model1_base)
     shap_te   = explainer.shap_values(X_te)
     shap_all  = explainer.shap_values(X)
 
@@ -713,7 +751,7 @@ def main() -> None:
     df["churn_prob"] = model1.predict_proba(X)[:, 1]
     df["churn_type"] = ChurnType.NOT_CHURNED.value
 
-    at_risk = df["churn_prob"] >= best_threshold  # use tuned threshold, not default 0.5
+    at_risk = df["churn_prob"] >= best_threshold
     invol_p = model2.predict_proba(df.loc[at_risk, active_features])[:, 1]
     df.loc[at_risk, "churn_type"] = np.where(
         invol_p > 0.5, ChurnType.INVOL_CHURN.value, ChurnType.VOL_CHURN.value
@@ -757,6 +795,7 @@ def main() -> None:
             reason_3           = reasons[2] if len(reasons) > 2 else "",
             discount_pct       = discount,
             recommended_action = action,
+            uplift_score       = calc_uplift(r, ctype),
         ))
 
     submission = pd.DataFrame([r.to_dict() for r in output_rows])
@@ -776,7 +815,6 @@ def main() -> None:
         print(f"    {r['recommended_action'][:90]}")
         print()
     print("Done.")
-
 
 if __name__ == "__main__":
     main()
